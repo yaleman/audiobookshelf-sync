@@ -17,6 +17,6 @@ jobs:
         with:
           activate-environment: "true"
           github-token: ${{ github.token }}
-      - name: Running mypy
+      - name: Running checks
         run: |
-          uv run mypy --strict $(basename $(pwd) | sed -E 's/-/_/g') tests/
+          uv run ty check
