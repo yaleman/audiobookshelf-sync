@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from audiobookshelf_sync.download import download_pending_items, sanitize_path_part
-from audiobookshelf_sync.queue import QueueStatus, add_pending_item, load_queue, save_queue
+from audiobookshelf_sync.queue import (
+    QueueStatus,
+    add_pending_item,
+    load_queue,
+    save_queue,
+)
 
 
 @dataclass
@@ -81,7 +86,9 @@ class FakeClient:
         self.session_config = FakeSessionConfig(session)
         self.fail = fail
 
-    async def get_library_item_book(self, *, book_id: str, expanded: bool = False) -> FakeBook:
+    async def get_library_item_book(
+        self, *, book_id: str, expanded: bool = False
+    ) -> FakeBook:
         assert expanded is True
         if self.fail:
             raise RuntimeError("boom")
@@ -109,7 +116,9 @@ def test_sanitize_path_part_removes_unsafe_characters() -> None:
 
 
 @pytest.mark.anyio
-async def test_download_pending_items_writes_tracks_and_marks_done(tmp_path: Path) -> None:
+async def test_download_pending_items_writes_tracks_and_marks_done(
+    tmp_path: Path,
+) -> None:
     queue_path = tmp_path / "audiobookshelf-sync.json"
     queue = load_queue(queue_path)
     add_pending_item(
@@ -135,14 +144,20 @@ async def test_download_pending_items_writes_tracks_and_marks_done(tmp_path: Pat
 
     loaded = load_queue(queue_path)
     assert loaded.items[0].status == QueueStatus.DONE
-    assert loaded.items[0].output_dir == "downloads/Example Book"
-    assert (tmp_path / "downloads" / "Example Book" / "01 Track One.mp3").read_bytes() == b"track-one"
-    assert (tmp_path / "downloads" / "Example Book" / "02 Track Two.mp3").read_bytes() == b"track-two"
+    assert loaded.items[0].output_dir == "downloads/Example Author - Example Book"
+    assert (
+        tmp_path / "downloads" / "Example Author - Example Book" / "01 Track One.mp3"
+    ).read_bytes() == b"track-one"
+    assert (
+        tmp_path / "downloads" / "Example Author - Example Book" / "02 Track Two.mp3"
+    ).read_bytes() == b"track-two"
     assert not list((tmp_path / "downloads" / "Example Book").glob("*.part"))
 
 
 @pytest.mark.anyio
-async def test_download_pending_items_marks_failed_and_continues(tmp_path: Path) -> None:
+async def test_download_pending_items_marks_failed_and_continues(
+    tmp_path: Path,
+) -> None:
     queue_path = tmp_path / "audiobookshelf-sync.json"
     queue = load_queue(queue_path)
     add_pending_item(
@@ -197,7 +212,7 @@ async def test_download_pending_items_reports_progress(tmp_path: Path) -> None:
         "Download directory: downloads",
         "Starting: Example Book - Example Author",
         "Fetching metadata: Example Book",
-        "Downloading 2 track(s) to downloads/Example Book",
+        "Downloading 2 track(s) to downloads/Example Author - Example Book",
         "Downloading track 1/2: 01 Track One.mp3",
         "Finished track 1/2: 01 Track One.mp3",
         "Downloading track 2/2: 02 Track Two.mp3",
@@ -208,7 +223,9 @@ async def test_download_pending_items_reports_progress(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_download_pending_items_skips_existing_track_files(tmp_path: Path) -> None:
+async def test_download_pending_items_skips_existing_track_files(
+    tmp_path: Path,
+) -> None:
     queue_path = tmp_path / "audiobookshelf-sync.json"
     queue = load_queue(queue_path)
     add_pending_item(
@@ -219,7 +236,7 @@ async def test_download_pending_items_skips_existing_track_files(tmp_path: Path)
         author="Example Author",
     )
     save_queue(queue_path, queue)
-    output_dir = tmp_path / "downloads" / "Example Book"
+    output_dir = tmp_path / "downloads" / "Example Author - Example Book"
     output_dir.mkdir(parents=True)
     existing_track = output_dir / "01 Track One.mp3"
     existing_track.write_bytes(b"already-here")
