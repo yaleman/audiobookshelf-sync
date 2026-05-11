@@ -36,6 +36,18 @@ def download() -> None:
     asyncio.run(run_download(config=config, logger=logger))
 
 
+@main.group()
+def configure() -> None:
+    """Inspect configuration values from Audiobookshelf targets."""
+
+
+@configure.command("dump-config")
+def dump_config() -> None:
+    """Dump the current configuration."""
+    config = Config.model_validate({})
+    click.echo(config.model_dump_json(indent=2))
+
+
 async def run_search(*, config: Config, limit: int, logger: Logger) -> None:
     async with aiohttp.ClientSession() as session:
         client = await get_client(session, config, logger)
