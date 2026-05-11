@@ -1,0 +1,25 @@
+[project]
+name = "audiobookshelf-sync"
+version = "0.1.0"
+description = "Pulling data from Audiobookshelf and syncing it to a local filesystem"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aioaudiobookshelf>=0.1.20",
+    "aiohttp>=3.13.5",
+    "click>=8.3.3",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.0.3", "ruff>=0.15.12", "ty>=0.0.34"]
+
+
+[project.scripts]
+audiobookshelf-sync = "audiobookshelf_sync.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
