@@ -8,6 +8,8 @@ from audiobookshelf_sync.queue import (
     mark_done,
     mark_failed,
     mark_downloading,
+    remove_item,
+    reset_item,
     save_queue,
 )
 
@@ -81,4 +83,49 @@ def test_status_transitions_update_queue_item() -> None:
     assert item.status == QueueStatus.DONE
     assert item.output_dir == "downloads/Example Book"
     assert item.downloaded_at is not None
+    assert item.error is None
+
+
+def test_remove_item_deletes_matching_queue_item() -> None:
+    queue = load_queue(Path("missing.json"))
+    add_pending_item(
+        queue,
+        item_id="book-1",
+        library_id="library-1",
+        title="Example Book",
+        author="Example Author",
+    )
+    add_pending_item(
+        queue,
+        item_id="book-2",
+        library_id="library-1",
+        title="Other Book",
+        author="Other Author",
+    )
+
+    removed = remove_item(queue, "book-1")
+
+    assert removed is not None
+    assert removed.id == "book-1"
+    assert [item.id for item in queue.items] == ["book-2"]
+
+
+def test_reset_item_marks_item_pending_and_clears_download_state() -> None:
+    item = QueueItem(
+        id="book-1",
+        library_id="library-1",
+        title="Example Book",
+        author="Example Author",
+    )
+    mark_done(item, output_dir=Path("downloads/Example Book"))
+    item.error = "old error"
+    queue = load_queue(Path("missing.json"))
+    queue.items.append(item)
+
+    reset = reset_item(queue, "book-1")
+
+    assert reset is item
+    assert item.status == QueueStatus.PENDING
+    assert item.downloaded_at is None
+    assert item.output_dir is None
     assert item.error is None

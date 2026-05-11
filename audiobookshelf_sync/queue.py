@@ -89,3 +89,22 @@ def mark_done(item: QueueItem, *, output_dir: Path) -> None:
 def mark_failed(item: QueueItem, error: BaseException) -> None:
     item.status = QueueStatus.FAILED
     item.error = str(error)
+
+
+def remove_item(queue: DownloadQueue, item_id: str) -> QueueItem | None:
+    item = find_item(queue, item_id)
+    if item is None:
+        return None
+    queue.items.remove(item)
+    return item
+
+
+def reset_item(queue: DownloadQueue, item_id: str) -> QueueItem | None:
+    item = find_item(queue, item_id)
+    if item is None:
+        return None
+    item.status = QueueStatus.PENDING
+    item.downloaded_at = None
+    item.output_dir = None
+    item.error = None
+    return item

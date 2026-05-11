@@ -7,7 +7,11 @@ from logging import Logger
 from typing import Any, Protocol
 
 import aiohttp
-from aioaudiobookshelf import SessionConfiguration, get_user_client_by_token
+from aioaudiobookshelf import (
+    SessionConfiguration,
+    get_user_client_by_token,
+    get_user_client,
+)
 
 from audiobookshelf_sync.config import Config
 
@@ -34,15 +38,31 @@ class AudiobookshelfClient(Protocol):
 async def get_client(
     session: aiohttp.ClientSession, config: Config, logger: Logger
 ) -> Any:
-    return await get_user_client_by_token(
-        session_config=SessionConfiguration(
-            session=session,
-            url=config.url,
-            logger=logger,
-            pagination_items_per_page=30,
-            token=config.token,
-        ),
-    )
+    if config.token is not None:
+        return await get_user_client_by_token(
+            session_config=SessionConfiguration(
+                session=session,
+                url=config.url,
+                logger=logger,
+                pagination_items_per_page=30,
+                token=config.token,
+            ),
+        )
+    elif config.username is not None and config.password is not None:
+        return await get_user_client(
+            session_config=SessionConfiguration(
+                session=session,
+                url=config.url,
+                logger=logger,
+                pagination_items_per_page=30,
+            ),
+            username=config.username,
+            password=config.password,
+        )
+    else:
+        raise ValueError(
+            "Invalid configuration: either token or username/password must be provided"
+        )
 
 
 async def iter_client(config: Config, logger: Logger) -> AsyncIterator[Any]:
@@ -85,7 +105,9 @@ def _map_book_result(
 
     media = item.get("media", {})
     metadata = media.get("metadata", {})
-    title = metadata.get("title") or item.get("relPath") or item.get("path") or item["id"]
+    title = (
+        metadata.get("title") or item.get("relPath") or item.get("path") or item["id"]
+    )
     author = _author_name(metadata)
 
     return BookSearchResult(
@@ -104,5 +126,9 @@ def _author_name(metadata: dict[str, Any]) -> str:
     if author_name:
         return str(author_name)
     authors = metadata.get("authors") or []
-    names = [str(author["name"]) for author in authors if isinstance(author, dict) and author.get("name")]
+    names = [
+        str(author["name"])
+        for author in authors
+        if isinstance(author, dict) and author.get("name")
+    ]
     return ", ".join(names) if names else "Unknown Author"
