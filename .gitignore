@@ -11,3 +11,6 @@ downloads/
 
 # Virtual environments
 .venv
+
+# status
+audiobookshelf-sync.json
