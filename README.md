@@ -9,8 +9,20 @@ Set these environment variables before running commands:
 
 ```sh
 export AUDIOBOOKSHELF_URL="https://audiobookshelf.example"
-export AUDIOBOOKSHELF_TOKEN="your-api-token"
 export AUDIOBOOKSHELF_DOWNLOAD_DIR="./downloads"
+```
+
+Set authentication with one of these:
+
+```sh
+export AUDIOBOOKSHELF_TOKEN="your-api-token"
+```
+
+or:
+
+```sh
+export AUDIOBOOKSHELF_USERNAME="your-username"
+export AUDIOBOOKSHELF_PASSWORD="your-secret-password"
 ```
 
 `AUDIOBOOKSHELF_DOWNLOAD_DIR` is optional and defaults to `./downloads`.
