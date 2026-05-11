@@ -53,7 +53,7 @@ async def download_pending_items(
         report(f"Starting: {item.title} - {item.author}")
         mark_downloading(item)
         save_queue(queue_path, queue)
-        output_dir = download_dir / sanitize_path_part(item.title)
+        output_dir = download_dir / sanitize_path_part(f"{item.author} - {item.title}")
         try:
             report(f"Fetching metadata: {item.title}")
             book = await client.get_library_item_book(book_id=item.id, expanded=True)
@@ -99,7 +99,9 @@ async def download_pending_items(
 
 def track_filename(track: Any, *, track_number: int) -> str:
     metadata = getattr(track, "metadata", None)
-    metadata_filename = getattr(metadata, "filename", None) if metadata is not None else None
+    metadata_filename = (
+        getattr(metadata, "filename", None) if metadata is not None else None
+    )
     if metadata_filename:
         return sanitize_path_part(str(metadata_filename))
 
