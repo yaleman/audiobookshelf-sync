@@ -74,6 +74,7 @@ async def search_books(
     client: AudiobookshelfClient, *, query: str, limit: int
 ) -> list[BookSearchResult]:
     results: list[BookSearchResult] = []
+    seen_item_ids: set[str] = set()
     for library in await client.get_all_libraries():
         if _library_media_type(library) != "book":
             continue
@@ -84,8 +85,20 @@ async def search_books(
         payload = json.loads(response)
         for raw_result in payload.get("book", []):
             mapped = _map_book_result(raw_result, library_name=library.name)
-            if mapped is not None:
+            if mapped is not None and mapped.id not in seen_item_ids:
                 results.append(mapped)
+                seen_item_ids.add(mapped.id)
+        for author in payload.get("authors", []):
+            author_id = author.get("id")
+            if not author_id:
+                continue
+            author_response = await client._get(f"/api/authors/{author_id}?include=items")
+            author_payload = json.loads(author_response)
+            for raw_item in author_payload.get("libraryItems", []):
+                mapped = _map_book_result(raw_item, library_name=library.name)
+                if mapped is not None and mapped.id not in seen_item_ids:
+                    results.append(mapped)
+                    seen_item_ids.add(mapped.id)
     return results
 
 
