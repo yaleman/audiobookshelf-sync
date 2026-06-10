@@ -39,6 +39,12 @@ Type a search query and press Enter. Select a result, then press `a` to add it
 to the queue. The queue is stored in `audiobookshelf-sync.json` in the current
 directory.
 
+The search TUI starts with a lazy-loaded book list when the query is empty. Use
+`F1` through `F5` to switch between books, series, collections, authors, and
+narrators. Select a series, collection, author, or narrator to browse its books;
+press `Escape` to return to the group list. Press `b`, then confirm with `y`, to
+queue every book in the selected group.
+
 ## Download
 
 Process all pending queued books:

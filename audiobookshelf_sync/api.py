@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from base64 import b64encode
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from enum import StrEnum
 from logging import Logger
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import aiohttp
 from aioaudiobookshelf import (
@@ -25,6 +28,30 @@ class BookSearchResult:
     author: str
     duration: float | None
     size: int | None
+
+
+class BrowseMode(StrEnum):
+    BOOKS = "books"
+    SERIES = "series"
+    COLLECTIONS = "collections"
+    AUTHORS = "authors"
+    NARRATORS = "narrators"
+
+
+@dataclass(frozen=True)
+class BrowseEntry:
+    mode: BrowseMode
+    id: str
+    name: str
+    library_id: str
+    library_name: str
+    count: int
+
+
+@dataclass(frozen=True)
+class BrowsePage[T]:
+    items: list[T]
+    total: int
 
 
 class AudiobookshelfClient(Protocol):
@@ -102,11 +129,240 @@ async def search_books(
     return results
 
 
+async def list_books(
+    client: AudiobookshelfClient, *, page: int, limit: int
+) -> BrowsePage[BookSearchResult]:
+    results: list[BookSearchResult] = []
+    total = 0
+    seen_item_ids: set[str] = set()
+    for library in await _book_libraries(client):
+        response = await client._get(
+            f"/api/libraries/{library.id_}/items",
+            params={
+                "minified": 1,
+                "limit": limit,
+                "page": page,
+                "sort": "media.metadata.title",
+            },
+        )
+        payload = json.loads(response)
+        total += int(payload.get("total", 0))
+        _append_mapped_books(
+            results,
+            payload.get("results", []),
+            library_name=library.name,
+            seen_item_ids=seen_item_ids,
+        )
+    return BrowsePage(items=results, total=total)
+
+
+async def list_browse_entries(
+    client: AudiobookshelfClient, *, mode: BrowseMode, page: int, limit: int
+) -> BrowsePage[BrowseEntry]:
+    if mode == BrowseMode.BOOKS:
+        raise ValueError("Use list_books for book browsing.")
+
+    results: list[BrowseEntry] = []
+    total = 0
+    for library in await _book_libraries(client):
+        if mode in (BrowseMode.SERIES, BrowseMode.COLLECTIONS):
+            page_result = await _list_paged_group_entries(
+                client, library=library, mode=mode, page=page, limit=limit
+            )
+            results.extend(page_result.items)
+            total += page_result.total
+        elif mode == BrowseMode.AUTHORS:
+            response = await client._get(f"/api/libraries/{library.id_}/authors")
+            payload = json.loads(response)
+            raw_entries = payload.get("authors", [])
+            total += len(raw_entries)
+            results.extend(
+                _map_raw_entries(
+                    raw_entries,
+                    mode=mode,
+                    library_id=library.id_,
+                    library_name=library.name,
+                    page=page,
+                    limit=limit,
+                )
+            )
+        elif mode == BrowseMode.NARRATORS:
+            response = await client._get(f"/api/libraries/{library.id_}/narrators")
+            payload = json.loads(response)
+            raw_entries = payload.get("narrators", [])
+            total += len(raw_entries)
+            results.extend(
+                _map_raw_entries(
+                    raw_entries,
+                    mode=mode,
+                    library_id=library.id_,
+                    library_name=library.name,
+                    page=page,
+                    limit=limit,
+                )
+            )
+    return BrowsePage(items=results, total=total)
+
+
+async def list_books_for_entry(
+    client: AudiobookshelfClient, *, entry: BrowseEntry
+) -> list[BookSearchResult]:
+    raw_items: list[dict[str, Any]]
+    if entry.mode == BrowseMode.SERIES:
+        response = await client._get(f"/api/series/{entry.id}")
+        raw_items = json.loads(response).get("books", [])
+    elif entry.mode == BrowseMode.COLLECTIONS:
+        response = await client._get(f"/api/collections/{entry.id}")
+        raw_items = json.loads(response).get("books", [])
+    elif entry.mode == BrowseMode.AUTHORS:
+        response = await client._get(f"/api/authors/{entry.id}?include=items")
+        raw_items = json.loads(response).get("libraryItems", [])
+    elif entry.mode == BrowseMode.NARRATORS:
+        raw_items = await _list_books_for_narrator(client, entry=entry)
+    else:
+        raw_items = []
+
+    results: list[BookSearchResult] = []
+    _append_mapped_books(
+        results,
+        raw_items,
+        library_name=entry.library_name,
+        seen_item_ids=set(),
+        library_id=entry.library_id,
+    )
+    return results
+
+
 def _library_media_type(library: Any) -> str:
     media_type = getattr(library, "media_type", None)
     if media_type is None:
         media_type = getattr(library, "mediaType", "")
     return str(getattr(media_type, "value", media_type))
+
+
+async def _book_libraries(client: AudiobookshelfClient) -> list[Any]:
+    return [
+        library
+        for library in await client.get_all_libraries()
+        if _library_media_type(library) == "book"
+    ]
+
+
+async def _list_paged_group_entries(
+    client: AudiobookshelfClient,
+    *,
+    library: Any,
+    mode: BrowseMode,
+    page: int,
+    limit: int,
+) -> BrowsePage[BrowseEntry]:
+    endpoint_name = "series" if mode == BrowseMode.SERIES else "collections"
+    response = await client._get(
+        f"/api/libraries/{library.id_}/{endpoint_name}",
+        params={"minified": 1, "limit": limit, "page": page},
+    )
+    payload = json.loads(response)
+    return BrowsePage(
+        items=_map_raw_entries(
+            payload.get("results", []),
+            mode=mode,
+            library_id=library.id_,
+            library_name=library.name,
+            page=0,
+            limit=limit,
+        ),
+        total=int(payload.get("total", 0)),
+    )
+
+
+def _map_raw_entries(
+    raw_entries: list[dict[str, Any]],
+    *,
+    mode: BrowseMode,
+    library_id: str,
+    library_name: str,
+    page: int,
+    limit: int,
+) -> list[BrowseEntry]:
+    start = page * limit
+    stop = start + limit
+    entries: list[BrowseEntry] = []
+    for raw_entry in raw_entries[start:stop]:
+        entry_id = raw_entry.get("id")
+        name = raw_entry.get("name")
+        if not entry_id or not name:
+            continue
+        entries.append(
+            BrowseEntry(
+                mode=mode,
+                id=str(entry_id),
+                name=str(name),
+                library_id=library_id,
+                library_name=library_name,
+                count=_entry_count(raw_entry),
+            )
+        )
+    return entries
+
+
+def _entry_count(raw_entry: dict[str, Any]) -> int:
+    num_books = raw_entry.get("numBooks")
+    if isinstance(num_books, int):
+        return num_books
+    books = raw_entry.get("books")
+    if isinstance(books, list):
+        return len(books)
+    return 0
+
+
+async def _list_books_for_narrator(
+    client: AudiobookshelfClient, *, entry: BrowseEntry
+) -> list[dict[str, Any]]:
+    raw_items: list[dict[str, Any]] = []
+    page = 0
+    limit = 50
+    filter_value = _filter_string("narrators", entry.name)
+    while True:
+        response = await client._get(
+            f"/api/libraries/{entry.library_id}/items",
+            params={
+                "minified": 1,
+                "limit": limit,
+                "page": page,
+                "filter": filter_value,
+                "sort": "media.metadata.title",
+            },
+        )
+        payload = json.loads(response)
+        page_items = payload.get("results", [])
+        raw_items.extend(page_items)
+        total = int(payload.get("total", len(raw_items)))
+        if not page_items or len(raw_items) >= total:
+            return raw_items
+        page += 1
+
+
+def _filter_string(group: str, value: str) -> str:
+    encoded = quote(b64encode(value.encode()).decode())
+    return f"{group}.{encoded}"
+
+
+def _append_mapped_books(
+    results: list[BookSearchResult],
+    raw_items: list[dict[str, Any]],
+    *,
+    library_name: str,
+    seen_item_ids: set[str],
+    library_id: str | None = None,
+) -> None:
+    for raw_item in raw_items:
+        mapped = _map_book_result(raw_item, library_name=library_name)
+        if mapped is None or mapped.id in seen_item_ids:
+            continue
+        if library_id is not None and mapped.library_id != library_id:
+            continue
+        results.append(mapped)
+        seen_item_ids.add(mapped.id)
 
 
 def _map_book_result(

@@ -14,9 +14,14 @@ from audiobookshelf_sync.queue import QUEUE_FILE
 from audiobookshelf_sync.tui import SearchQueueApp
 
 
-@click.group()
-def main() -> None:
+@click.group(invoke_without_command=True)
+@click.pass_context
+def main(ctx: click.Context) -> None:
     """Search Audiobookshelf and download queued books."""
+
+    # default to search TUI if no subcommand is provided
+    if ctx.invoked_subcommand is None:
+        search()
 
 
 @main.command()
