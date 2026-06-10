@@ -106,6 +106,36 @@ async def fake_list_entries(
     )
 
 
+async def fake_paged_author_entries(
+    client: object, *, mode: BrowseMode, page: int, limit: int
+) -> BrowsePage[BrowseEntry]:
+    assert limit == 50
+    assert mode == BrowseMode.AUTHORS
+    pages = [
+        [
+            BrowseEntry(
+                mode=BrowseMode.AUTHORS,
+                id="author-1",
+                name="Frank Herbert",
+                library_id="library-1",
+                library_name="Books",
+                count=2,
+            )
+        ],
+        [
+            BrowseEntry(
+                mode=BrowseMode.AUTHORS,
+                id="author-2",
+                name="Isaac Asimov",
+                library_id="library-1",
+                library_name="Books",
+                count=1,
+            )
+        ],
+    ]
+    return BrowsePage(total=2, items=pages[page] if page < len(pages) else [])
+
+
 async def fake_list_entry_books(
     client: object, *, entry: BrowseEntry
 ) -> list[BookSearchResult]:
@@ -338,6 +368,70 @@ async def test_author_mode_filters_entries_locally(tmp_path: Path) -> None:
     assert isinstance(entry_item, EntryItem)
     assert entry_item.display_text == "Isaac Asimov - Books - 1 book"
     assert app.status_message == "Showing 1 of 2 authors."
+
+
+@pytest.mark.anyio
+async def test_author_mode_filter_loads_unloaded_entries(tmp_path: Path) -> None:
+    app = SearchQueueApp(
+        client=object(),
+        queue_path=tmp_path / "audiobookshelf-sync.json",
+        limit=25,
+        search_func=fake_search,
+        list_books_func=fake_list_books,
+        list_entries_func=fake_paged_author_entries,
+        list_entry_books_func=fake_list_entry_books,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("f4")
+        await pilot.pause()
+        await pilot.press("i", "s", "a")
+        await pilot.pause()
+        result_list = app.query_one("#results", ListView)
+        entry_item = result_list.children[0]
+
+    assert isinstance(entry_item, EntryItem)
+    assert entry_item.display_text == "Isaac Asimov - Books - 1 book"
+    assert app.status_message == "Showing 1 of 2 authors."
+
+
+@pytest.mark.anyio
+async def test_removing_queue_item_preserves_group_browse_results(
+    tmp_path: Path,
+) -> None:
+    queue_path = tmp_path / "audiobookshelf-sync.json"
+    queue = load_queue(queue_path)
+    add_pending_item(
+        queue,
+        item_id="book-1",
+        library_id="library-1",
+        title="Dune",
+        author="Frank Herbert",
+    )
+    save_queue(queue_path, queue)
+    app = SearchQueueApp(
+        client=object(),
+        queue_path=queue_path,
+        limit=25,
+        search_func=fake_search,
+        list_books_func=fake_list_books,
+        list_entries_func=fake_list_entries,
+        list_entry_books_func=fake_list_entry_books,
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("f4")
+        await pilot.pause()
+        queue_list = app.query_one("#queue", ListView)
+        queue_list.focus()
+        queue_list.index = 0
+        await pilot.press("d")
+        await pilot.pause()
+        result_list = app.query_one("#results", ListView)
+        first_entry = result_list.children[0]
+
+    assert isinstance(first_entry, EntryItem)
+    assert first_entry.display_text == "Frank Herbert - Books - 2 books"
 
 
 @pytest.mark.anyio

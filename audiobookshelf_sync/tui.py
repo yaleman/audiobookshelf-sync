@@ -176,9 +176,7 @@ class SearchQueueApp(App[None]):
             await self.load_mode_page(reset=True)
             return
         if self.mode != BrowseMode.BOOKS:
-            self.apply_entry_filter(query)
-            await self.refresh_entries()
-            self.set_browse_status()
+            await self.apply_entry_filter_from_query(query)
             return
         self.set_status(f"Searching for {query}...")
         results = await self.search_func(self.client, query=query, limit=self.limit)
@@ -194,9 +192,7 @@ class SearchQueueApp(App[None]):
     async def on_input_changed(self, event: Input.Changed) -> None:
         if self.mode == BrowseMode.BOOKS or self.drilled_entry is not None:
             return
-        self.apply_entry_filter(event.value.strip())
-        await self.refresh_entries()
-        self.set_browse_status()
+        await self.apply_entry_filter_from_query(event.value.strip())
 
     async def load_mode_page(self, *, reset: bool) -> None:
         self.bulk_confirmation_pending = False
@@ -352,7 +348,7 @@ class SearchQueueApp(App[None]):
             return
         save_queue(self.queue_path, queue)
         await self.refresh_queue()
-        await self.refresh_results()
+        await self.refresh_results_pane()
         self.set_status(f"Removed {removed.title}.")
 
     async def action_reset_queue_item(self) -> None:
@@ -369,7 +365,7 @@ class SearchQueueApp(App[None]):
             return
         save_queue(self.queue_path, queue)
         await self.refresh_queue()
-        await self.refresh_results()
+        await self.refresh_results_pane()
         self.set_status(f"Reset {reset.title} to pending.")
 
     async def add_result_item(self, item: ListItem | None) -> None:
@@ -436,6 +432,29 @@ class SearchQueueApp(App[None]):
         self.filtered_entries = [
             entry for entry in self.entries if query_lower in entry.name.lower()
         ]
+
+    async def apply_entry_filter_from_query(self, query: str) -> None:
+        if query:
+            await self.load_remaining_entries()
+        self.apply_entry_filter(query)
+        await self.refresh_entries()
+        self.set_browse_status()
+
+    async def load_remaining_entries(self) -> None:
+        if self.mode == BrowseMode.BOOKS or self.drilled_entry is not None:
+            return
+        while len(self.entries) < self.total:
+            before_count = len(self.entries)
+            self.current_page += 1
+            await self.load_mode_page(reset=False)
+            if len(self.entries) == before_count:
+                return
+
+    async def refresh_results_pane(self) -> None:
+        if self.mode != BrowseMode.BOOKS and self.drilled_entry is None:
+            await self.refresh_entries()
+            return
+        await self.refresh_results()
 
     def set_browse_status(self) -> None:
         if self.mode == BrowseMode.BOOKS:
