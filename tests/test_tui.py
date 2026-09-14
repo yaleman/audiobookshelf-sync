@@ -1,10 +1,11 @@
 from pathlib import Path
 
 import pytest
-from textual.widgets import ListView
+from textual.widgets import Input, ListView, RadioButton, Static
 
 from audiobookshelf_sync.api import (
     BookSearchResult,
+    BookSort,
     BrowseEntry,
     BrowseMode,
     BrowsePage,
@@ -17,7 +18,7 @@ from audiobookshelf_sync.queue import (
     mark_done,
     save_queue,
 )
-from audiobookshelf_sync.tui import EntryItem, ResultItem, SearchQueueApp
+from audiobookshelf_sync.tui import EntryItem, ResultItem, SearchQueueApp, SortModal
 
 
 async def fake_search(
@@ -39,10 +40,12 @@ async def fake_search(
 
 
 async def fake_list_books(
-    client: object, *, page: int, limit: int
+    client: object, *, page: int, limit: int, sort: BookSort, descending: bool
 ) -> BrowsePage[BookSearchResult]:
     assert page == 0
     assert limit == 50
+    assert sort == BookSort.ADDED_AT
+    assert descending
     return BrowsePage(
         total=2,
         items=[
@@ -60,9 +63,11 @@ async def fake_list_books(
 
 
 async def fake_list_more_books(
-    client: object, *, page: int, limit: int
+    client: object, *, page: int, limit: int, sort: BookSort, descending: bool
 ) -> BrowsePage[BookSearchResult]:
     assert limit == 50
+    assert sort == BookSort.ADDED_AT
+    assert descending
     items = [
         BookSearchResult(
             id=f"book-{page + 1}",
@@ -75,6 +80,61 @@ async def fake_list_more_books(
         )
     ]
     return BrowsePage(total=2, items=items)
+
+
+def varied_books() -> list[BookSearchResult]:
+    return [
+        BookSearchResult(
+            "older",
+            "library-1",
+            "Books",
+            "Zulu",
+            "Ada Alpha",
+            None,
+            None,
+            "Alpha, Ada",
+            100,
+            2000,
+        ),
+        BookSearchResult(
+            "newer",
+            "library-1",
+            "Books",
+            "Alpha",
+            "Zoe Zeta",
+            None,
+            None,
+            "Zeta, Zoe",
+            200,
+            2020,
+        ),
+    ]
+
+
+async def fake_sorted_books(
+    client: object, *, page: int, limit: int, sort: BookSort, descending: bool
+) -> BrowsePage[BookSearchResult]:
+    from audiobookshelf_sync.api import sort_books
+
+    assert page == 0
+    assert limit == 50
+    return BrowsePage(
+        total=2, items=sort_books(varied_books(), sort=sort, descending=descending)
+    )
+
+
+async def fake_sorted_search(
+    client: object, *, query: str, limit: int
+) -> list[BookSearchResult]:
+    assert query == "book"
+    return varied_books()
+
+
+async def fake_varied_entry_books(
+    client: object, *, entry: BrowseEntry
+) -> list[BookSearchResult]:
+    assert entry.id == "author-1"
+    return varied_books()
 
 
 async def fake_list_entries(
@@ -498,3 +558,99 @@ async def test_bulk_add_requires_confirmation_and_queues_group_books(
 
     queue = load_queue(queue_path)
     assert [item.id for item in queue.items] == ["book-1", "book-2"]
+
+
+@pytest.mark.anyio
+async def test_sort_modal_applies_and_cancels_from_search_input_and_results(
+    tmp_path: Path,
+) -> None:
+    app = SearchQueueApp(
+        client=object(),
+        queue_path=tmp_path / "queue.json",
+        limit=25,
+        list_books_func=fake_sorted_books,
+    )
+    async with app.run_test() as pilot:
+        assert app.query_one("#query", Input).has_focus
+        assert [book.id for book in app.results] == ["newer", "older"]
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, SortModal)
+        app.screen.query_one("#title", RadioButton).value = True
+        await pilot.pause()
+        assert app.screen.query_one("#ascending", RadioButton).value
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [book.id for book in app.results] == ["newer", "older"]
+        assert app.query_one("#results-heading", Static).content == "Results · Title ↑"
+
+        app.query_one("#results", ListView).focus()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, SortModal)
+        app.screen.query_one("#descending", RadioButton).value = True
+        await pilot.press("escape")
+        await pilot.pause()
+        assert [book.id for book in app.results] == ["newer", "older"]
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, SortModal)
+        app.screen.query_one("#descending", RadioButton).value = True
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [book.id for book in app.results] == ["older", "newer"]
+
+
+@pytest.mark.anyio
+async def test_sorting_search_results_does_not_replace_search_or_queue(
+    tmp_path: Path,
+) -> None:
+    queue_path = tmp_path / "queue.json"
+    app = SearchQueueApp(
+        client=object(),
+        queue_path=queue_path,
+        limit=25,
+        search_func=fake_sorted_search,
+        list_books_func=fake_sorted_books,
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("b", "o", "o", "k", "enter")
+        await pilot.pause()
+        assert [book.id for book in app.results] == ["newer", "older"]
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, SortModal)
+        app.screen.query_one("#author_first_last", RadioButton).value = True
+        await pilot.pause()
+        assert app.screen.current_descending is False
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [book.id for book in app.results] == ["older", "newer"]
+        assert app.query_one("#query", Input).value == "book"
+    assert load_queue(queue_path).items == []
+
+
+@pytest.mark.anyio
+async def test_sort_choice_applies_when_opening_group_books(tmp_path: Path) -> None:
+    app = SearchQueueApp(
+        client=object(),
+        queue_path=tmp_path / "queue.json",
+        limit=25,
+        list_books_func=fake_sorted_books,
+        list_entries_func=fake_list_entries,
+        list_entry_books_func=fake_varied_entry_books,
+    )
+    async with app.run_test() as pilot:
+        await pilot.press("f4", "ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, SortModal)
+        app.screen.query_one("#author_last_first", RadioButton).value = True
+        await pilot.press("enter")
+        await pilot.pause()
+        results = app.query_one("#results", ListView)
+        results.focus()
+        results.index = 0
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [book.id for book in app.results] == ["older", "newer"]

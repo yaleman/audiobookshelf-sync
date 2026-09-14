@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 
+from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Static
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RadioButton,
+    RadioSet,
+    Static,
+)
 
 from audiobookshelf_sync.api import (
     BookSearchResult,
+    BookSort,
     BrowseEntry,
     BrowseMode,
     BrowsePage,
@@ -16,6 +32,7 @@ from audiobookshelf_sync.api import (
     list_books_for_entry,
     list_browse_entries,
     search_books,
+    sort_books,
 )
 from audiobookshelf_sync.queue import (
     QUEUE_FILE,
@@ -28,6 +45,100 @@ from audiobookshelf_sync.queue import (
 )
 
 BROWSE_LIMIT = 50
+
+SORT_LABELS = {
+    BookSort.AUTHOR_FIRST_LAST: "Author (first, last)",
+    BookSort.AUTHOR_LAST_FIRST: "Author (last, first)",
+    BookSort.TITLE: "Title",
+    BookSort.ADDED_AT: "Added at",
+    BookSort.PUBLISH_YEAR: "Publish year",
+}
+
+
+@dataclass(frozen=True)
+class SortSelection:
+    sort: BookSort
+    descending: bool
+
+
+class SortModal(ModalScreen[SortSelection | None]):
+    CSS = """
+    SortModal {
+        align: center middle;
+    }
+    #sort-dialog {
+        width: 42;
+        height: auto;
+        border: solid $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #sort-actions {
+        height: auto;
+        align-horizontal: right;
+    }
+    """
+    BINDINGS = [
+        Binding("enter", "apply", "Apply", priority=True),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, selection: SortSelection) -> None:
+        super().__init__()
+        self.selection = selection
+        self.current_field = selection.sort
+        self.current_descending = selection.descending
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sort-dialog"):
+            yield Label("Sort by")
+            with RadioSet(id="sort-field"):
+                for sort, label in SORT_LABELS.items():
+                    yield RadioButton(
+                        label, value=sort == self.selection.sort, id=sort.value
+                    )
+            yield Label("Direction")
+            with RadioSet(id="sort-direction"):
+                yield RadioButton(
+                    "Ascending", value=not self.selection.descending, id="ascending"
+                )
+                yield RadioButton(
+                    "Descending", value=self.selection.descending, id="descending"
+                )
+            with Horizontal(id="sort-actions"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Apply", variant="primary", id="apply")
+
+    def action_apply(self) -> None:
+        self.dismiss(
+            SortSelection(sort=self.current_field, descending=self.current_descending)
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        if event.pressed.id is None:
+            return
+        if event.radio_set.id == "sort-direction":
+            self.current_descending = event.pressed.id == "descending"
+            return
+        if event.radio_set.id != "sort-field":
+            return
+        field = BookSort(event.pressed.id)
+        if field == self.current_field:
+            return
+        self.current_field = field
+        default_descending = field in (BookSort.ADDED_AT, BookSort.PUBLISH_YEAR)
+        self.current_descending = default_descending
+        direction_id = "descending" if default_descending else "ascending"
+        self.query_one(f"#{direction_id}", RadioButton).value = True
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply":
+            self.action_apply()
+        else:
+            self.action_cancel()
 
 
 class ResultItem(ListItem):
@@ -73,6 +184,7 @@ class SearchQueueApp(App[None]):
     """
 
     BINDINGS = [
+        ("ctrl+s", "open_sort", "Sort"),
         ("f1", "switch_books", "Books"),
         ("f2", "switch_series", "Series"),
         ("f3", "switch_collections", "Collections"),
@@ -123,6 +235,8 @@ class SearchQueueApp(App[None]):
         self.total = 0
         self.drilled_entry: BrowseEntry | None = None
         self.bulk_confirmation_pending = False
+        self.sort_selection = SortSelection(BookSort.ADDED_AT, descending=True)
+        self.search_active = False
         self.status_message = ""
 
     def compose(self) -> ComposeResult:
@@ -131,7 +245,7 @@ class SearchQueueApp(App[None]):
         yield Input(placeholder="Search books", id="query")
         with Horizontal(id="body"):
             with Vertical():
-                yield Static("Results")
+                yield Static("", id="results-heading")
                 yield ListView(id="results")
             with Vertical():
                 yield Static("Queue")
@@ -142,6 +256,7 @@ class SearchQueueApp(App[None]):
     async def on_mount(self) -> None:
         await self.refresh_queue()
         self.update_mode_label()
+        self.update_sort_label()
         await self.load_mode_page(reset=True)
         self.query_one("#query", Input).focus()
 
@@ -164,8 +279,10 @@ class SearchQueueApp(App[None]):
         self.mode = mode
         self.drilled_entry = None
         self.bulk_confirmation_pending = False
+        self.search_active = False
         self.query_one("#query", Input).value = ""
         self.update_mode_label()
+        self.update_sort_label()
         await self.load_mode_page(reset=True)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -173,12 +290,14 @@ class SearchQueueApp(App[None]):
         if self.drilled_entry is not None:
             return
         if not query:
+            self.search_active = False
             await self.load_mode_page(reset=True)
             return
         if self.mode != BrowseMode.BOOKS:
             await self.apply_entry_filter_from_query(query)
             return
         self.set_status(f"Searching for {query}...")
+        self.search_active = True
         results = await self.search_func(self.client, query=query, limit=self.limit)
         self.results = results
         self.total = len(results)
@@ -204,7 +323,11 @@ class SearchQueueApp(App[None]):
             self.filtered_entries = []
         if self.mode == BrowseMode.BOOKS:
             page = await self.list_books_func(
-                self.client, page=self.current_page, limit=BROWSE_LIMIT
+                self.client,
+                page=self.current_page,
+                limit=BROWSE_LIMIT,
+                sort=self.sort_selection.sort,
+                descending=self.sort_selection.descending,
             )
             self.total = page.total
             self.results = page.items if reset else [*self.results, *page.items]
@@ -224,7 +347,9 @@ class SearchQueueApp(App[None]):
     async def load_more_if_needed(self) -> None:
         if self.drilled_entry is not None:
             return
-        loaded_count = len(self.results) if self.mode == BrowseMode.BOOKS else len(self.entries)
+        loaded_count = (
+            len(self.results) if self.mode == BrowseMode.BOOKS else len(self.entries)
+        )
         if loaded_count >= self.total:
             return
         self.current_page += 1
@@ -240,13 +365,20 @@ class SearchQueueApp(App[None]):
             await self.load_more_if_needed()
 
     async def refresh_results(self) -> None:
+        self.results = sort_books(
+            self.results,
+            sort=self.sort_selection.sort,
+            descending=self.sort_selection.descending,
+        )
         queue = load_queue(self.queue_path)
         selected_ids = {item.id for item in queue.items}
         result_list = self.query_one("#results", ListView)
         selected_index = result_list.index
         await result_list.clear()
         for result in self.results:
-            await result_list.append(ResultItem(result, selected=result.id in selected_ids))
+            await result_list.append(
+                ResultItem(result, selected=result.id in selected_ids)
+            )
         if self.results:
             result_list.index = max(0, min(selected_index or 0, len(self.results) - 1))
 
@@ -257,7 +389,9 @@ class SearchQueueApp(App[None]):
         for entry in self.filtered_entries:
             await result_list.append(EntryItem(entry))
         if self.filtered_entries:
-            result_list.index = max(0, min(selected_index or 0, len(self.filtered_entries) - 1))
+            result_list.index = max(
+                0, min(selected_index or 0, len(self.filtered_entries) - 1)
+            )
 
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id == "results":
@@ -277,6 +411,7 @@ class SearchQueueApp(App[None]):
 
     async def drill_into_entry(self, entry: BrowseEntry) -> None:
         self.drilled_entry = entry
+        self.update_sort_label()
         self.bulk_confirmation_pending = False
         self.results = await self.list_entry_books_func(self.client, entry=entry)
         self.total = len(self.results)
@@ -286,10 +421,26 @@ class SearchQueueApp(App[None]):
             f"Showing {len(self.results)} book(s) for {entry.name}. Press b to add all."
         )
 
+    @work
+    async def action_open_sort(self) -> None:
+        selection = await self.push_screen_wait(SortModal(self.sort_selection))
+        if selection is None or selection == self.sort_selection:
+            return
+        self.sort_selection = selection
+        self.update_sort_label()
+        if self.drilled_entry is not None or self.search_active:
+            await self.refresh_results()
+        elif self.mode == BrowseMode.BOOKS:
+            await self.load_mode_page(reset=True)
+        result_list = self.query_one("#results", ListView)
+        if self.results and (self.mode == BrowseMode.BOOKS or self.drilled_entry):
+            result_list.index = 0
+
     async def action_go_back(self) -> None:
         if self.drilled_entry is None:
             return
         self.drilled_entry = None
+        self.update_sort_label()
         self.bulk_confirmation_pending = False
         await self.refresh_entries()
         self.query_one("#results", ListView).focus()
@@ -386,7 +537,9 @@ class SearchQueueApp(App[None]):
         await self.refresh_queue()
         await self.refresh_results()
         if len(queue.items) == before_count:
-            self.set_status(f"{queued.title} is already queued with status {queued.status}.")
+            self.set_status(
+                f"{queued.title} is already queued with status {queued.status}."
+            )
         else:
             self.set_status(f"Queued {queued.title}.")
 
@@ -419,10 +572,22 @@ class SearchQueueApp(App[None]):
             ("F5", BrowseMode.NARRATORS),
         ]
         labels = [
-            f"[{key} {mode.value.title()}]" if mode == self.mode else f"{key} {mode.value.title()}"
+            f"[{key} {mode.value.title()}]"
+            if mode == self.mode
+            else f"{key} {mode.value.title()}"
             for key, mode in modes
         ]
         self.query_one("#mode", Static).update("  ".join(labels))
+
+    def update_sort_label(self) -> None:
+        if self.mode != BrowseMode.BOOKS and self.drilled_entry is None:
+            self.query_one("#results-heading", Static).update("Results")
+            return
+        direction = "↓" if self.sort_selection.descending else "↑"
+        label = SORT_LABELS[self.sort_selection.sort]
+        self.query_one("#results-heading", Static).update(
+            f"Results · {label} {direction}"
+        )
 
     def apply_entry_filter(self, query: str) -> None:
         if not query:
@@ -461,7 +626,9 @@ class SearchQueueApp(App[None]):
             self.set_status(f"Showing {len(self.results)} of {self.total} books.")
             return
         label = self.mode.value
-        self.set_status(f"Showing {len(self.filtered_entries)} of {self.total} {label}.")
+        self.set_status(
+            f"Showing {len(self.filtered_entries)} of {self.total} {label}."
+        )
 
 
 def format_result(result: BookSearchResult, *, selected: bool = False) -> str:

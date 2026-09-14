@@ -28,6 +28,58 @@ class BookSearchResult:
     author: str
     duration: float | None
     size: int | None
+    author_last_first: str | None = None
+    added_at: int | None = None
+    published_year: int | None = None
+    author_known: bool = True
+
+
+class BookSort(StrEnum):
+    AUTHOR_FIRST_LAST = "author_first_last"
+    AUTHOR_LAST_FIRST = "author_last_first"
+    TITLE = "title"
+    ADDED_AT = "added_at"
+    PUBLISH_YEAR = "publish_year"
+
+    @property
+    def api_field(self) -> str:
+        return {
+            BookSort.AUTHOR_FIRST_LAST: "media.metadata.authorName",
+            BookSort.AUTHOR_LAST_FIRST: "media.metadata.authorNameLF",
+            BookSort.TITLE: "media.metadata.title",
+            BookSort.ADDED_AT: "addedAt",
+            BookSort.PUBLISH_YEAR: "media.metadata.publishedYear",
+        }[self]
+
+
+def sort_books(
+    books: list[BookSearchResult], *, sort: BookSort, descending: bool
+) -> list[BookSearchResult]:
+    def primary(book: BookSearchResult) -> str | int | None:
+        match sort:
+            case BookSort.AUTHOR_FIRST_LAST:
+                return (book.author.casefold() or None) if book.author_known else None
+            case BookSort.AUTHOR_LAST_FIRST:
+                return (
+                    book.author_last_first.casefold()
+                    if book.author_last_first
+                    else None
+                )
+            case BookSort.TITLE:
+                return book.title.casefold() or None
+            case BookSort.ADDED_AT:
+                return book.added_at
+            case BookSort.PUBLISH_YEAR:
+                return book.published_year
+
+    ordered = sorted(books, key=lambda book: (book.title.casefold(), book.id))
+    known = [book for book in ordered if primary(book) is not None]
+    unknown = [book for book in ordered if primary(book) is None]
+    if sort in (BookSort.ADDED_AT, BookSort.PUBLISH_YEAR):
+        known.sort(key=lambda book: int(primary(book) or 0), reverse=descending)
+    else:
+        known.sort(key=lambda book: str(primary(book) or ""), reverse=descending)
+    return [*known, *unknown]
 
 
 class BrowseMode(StrEnum):
@@ -119,7 +171,9 @@ async def search_books(
             author_id = author.get("id")
             if not author_id:
                 continue
-            author_response = await client._get(f"/api/authors/{author_id}?include=items")
+            author_response = await client._get(
+                f"/api/authors/{author_id}?include=items"
+            )
             author_payload = json.loads(author_response)
             for raw_item in author_payload.get("libraryItems", []):
                 mapped = _map_book_result(raw_item, library_name=library.name)
@@ -130,7 +184,12 @@ async def search_books(
 
 
 async def list_books(
-    client: AudiobookshelfClient, *, page: int, limit: int
+    client: AudiobookshelfClient,
+    *,
+    page: int,
+    limit: int,
+    sort: BookSort = BookSort.ADDED_AT,
+    descending: bool = True,
 ) -> BrowsePage[BookSearchResult]:
     results: list[BookSearchResult] = []
     total = 0
@@ -140,9 +199,10 @@ async def list_books(
             f"/api/libraries/{library.id_}/items",
             params={
                 "minified": 1,
-                "limit": limit,
-                "page": page,
-                "sort": "media.metadata.title",
+                "limit": (page + 1) * limit,
+                "page": 0,
+                "sort": sort.api_field,
+                "desc": int(descending),
             },
         )
         payload = json.loads(response)
@@ -153,7 +213,8 @@ async def list_books(
             library_name=library.name,
             seen_item_ids=seen_item_ids,
         )
-    return BrowsePage(items=results, total=total)
+    ordered = sort_books(results, sort=sort, descending=descending)
+    return BrowsePage(items=ordered[page * limit : (page + 1) * limit], total=total)
 
 
 async def list_browse_entries(
@@ -387,7 +448,19 @@ def _map_book_result(
         author=author,
         duration=media.get("duration"),
         size=item.get("size") or media.get("size"),
+        author_last_first=metadata.get("authorNameLF"),
+        added_at=item.get("addedAt"),
+        published_year=_published_year(metadata.get("publishedYear")),
+        author_known=bool(metadata.get("authorName") or metadata.get("authors")),
     )
+
+
+def _published_year(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return None
 
 
 def _author_name(metadata: dict[str, Any]) -> str:

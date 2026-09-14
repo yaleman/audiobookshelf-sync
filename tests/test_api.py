@@ -4,12 +4,15 @@ from dataclasses import dataclass
 import pytest
 
 from audiobookshelf_sync.api import (
+    BookSearchResult,
+    BookSort,
     BrowseEntry,
     BrowseMode,
     list_books,
     list_books_for_entry,
     list_browse_entries,
     search_books,
+    sort_books,
 )
 
 
@@ -183,9 +186,10 @@ class FakeBrowseClient:
         if endpoint == "/api/libraries/books/items":
             assert params == {
                 "minified": 1,
-                "limit": 2,
-                "page": 1,
-                "sort": "media.metadata.title",
+                "limit": 4,
+                "page": 0,
+                "sort": "addedAt",
+                "desc": 1,
             }
             return json.dumps(
                 {
@@ -194,9 +198,34 @@ class FakeBrowseClient:
                     "page": 1,
                     "results": [
                         {
+                            "id": "book-1",
+                            "libraryId": "books",
+                            "mediaType": "book",
+                            "addedAt": 300,
+                            "media": {
+                                "metadata": {
+                                    "title": "Dune",
+                                    "authorName": "Frank Herbert",
+                                }
+                            },
+                        },
+                        {
+                            "id": "book-2",
+                            "libraryId": "books",
+                            "mediaType": "book",
+                            "addedAt": 200,
+                            "media": {
+                                "metadata": {
+                                    "title": "Dune Messiah",
+                                    "authorName": "Frank Herbert",
+                                }
+                            },
+                        },
+                        {
                             "id": "book-3",
                             "libraryId": "books",
                             "mediaType": "book",
+                            "addedAt": 100,
                             "size": 1234,
                             "media": {
                                 "duration": 1800.0,
@@ -205,16 +234,17 @@ class FakeBrowseClient:
                                     "authorName": "Frank Herbert",
                                 },
                             },
-                        }
+                        },
                     ],
                 }
             ).encode()
         if endpoint == "/api/libraries/other-books/items":
             assert params == {
                 "minified": 1,
-                "limit": 2,
-                "page": 1,
-                "sort": "media.metadata.title",
+                "limit": 4,
+                "page": 0,
+                "sort": "addedAt",
+                "desc": 1,
             }
             return json.dumps(
                 {"total": 0, "limit": 2, "page": 1, "results": []}
@@ -300,7 +330,11 @@ class FakeBrowseEntryClient:
             ).encode()
         if endpoint == "/api/libraries/books/narrators":
             return json.dumps(
-                {"narrators": [{"id": "narrator-1", "name": "Simon Vance", "numBooks": 2}]}
+                {
+                    "narrators": [
+                        {"id": "narrator-1", "name": "Simon Vance", "numBooks": 2}
+                    ]
+                }
             ).encode()
         if endpoint == "/api/libraries/other-books/narrators":
             return json.dumps({"narrators": []}).encode()
@@ -385,6 +419,113 @@ async def test_list_books_filters_to_book_libraries_and_maps_page_results() -> N
     assert [item.id for item in page.items] == ["book-3"]
     assert page.items[0].library_name == "Books"
     assert page.items[0].title == "Children of Dune"
+
+
+def test_sort_books_supports_every_field_and_direction_with_missing_values_last() -> (
+    None
+):
+    books = [
+        BookSearchResult(
+            "one",
+            "library",
+            "Books",
+            "Zulu",
+            "Ada Alpha",
+            None,
+            None,
+            "Alpha, Ada",
+            100,
+            2001,
+        ),
+        BookSearchResult(
+            "two",
+            "library",
+            "Books",
+            "Alpha",
+            "Zoe Zeta",
+            None,
+            None,
+            "Zeta, Zoe",
+            200,
+            2020,
+        ),
+        BookSearchResult(
+            "unknown",
+            "library",
+            "Books",
+            "Beta",
+            "Unknown Author",
+            None,
+            None,
+            author_known=False,
+        ),
+    ]
+    expected = {
+        BookSort.AUTHOR_FIRST_LAST: ["one", "two"],
+        BookSort.AUTHOR_LAST_FIRST: ["one", "two"],
+        BookSort.TITLE: ["two", "unknown", "one"],
+        BookSort.ADDED_AT: ["one", "two"],
+        BookSort.PUBLISH_YEAR: ["one", "two"],
+    }
+    for field, ascending in expected.items():
+        ascending_ids = [
+            book.id for book in sort_books(books, sort=field, descending=False)
+        ]
+        descending_ids = [
+            book.id for book in sort_books(books, sort=field, descending=True)
+        ]
+        assert ascending_ids[: len(ascending)] == ascending
+        assert descending_ids[: len(ascending)] == list(reversed(ascending))
+        if field != BookSort.TITLE:
+            assert ascending_ids[-1] == descending_ids[-1] == "unknown"
+
+
+@pytest.mark.anyio
+async def test_list_books_merges_multiple_libraries_across_page_boundaries() -> None:
+    class SortedClient:
+        async def get_all_libraries(self) -> list[FakeLibrary]:
+            return [
+                FakeLibrary("first", "First", "book"),
+                FakeLibrary("second", "Second", "book"),
+            ]
+
+        async def _get(
+            self, endpoint: str, params: dict[str, str | int] | None = None
+        ) -> bytes:
+            assert params is not None
+            assert params["sort"] == "addedAt"
+            assert params["desc"] == 1
+            assert params["page"] == 0
+            times = [90, 60, 30] if "/first/" in endpoint else [80, 70, 20]
+            items = [
+                {
+                    "id": f"{endpoint}-{time}",
+                    "libraryId": "first" if "/first/" in endpoint else "second",
+                    "mediaType": "book",
+                    "addedAt": time,
+                    "media": {
+                        "metadata": {
+                            "title": f"Book {time}",
+                            "authorName": "Author",
+                            "authorNameLF": "Author",
+                            "publishedYear": "2008",
+                        }
+                    },
+                }
+                for time in times[: int(params["limit"])]
+            ]
+            return json.dumps({"total": 3, "results": items}).encode()
+
+    client = SortedClient()
+    pages = [await list_books(client, page=page, limit=2) for page in range(3)]
+    assert [page.total for page in pages] == [6, 6, 6]
+    assert [[book.added_at for book in page.items] for page in pages] == [
+        [90, 80],
+        [70, 60],
+        [30, 20],
+    ]
+    assert pages[0].items[0].author_last_first == "Author"
+    assert pages[0].items[0].published_year == 2008
 
 
 @pytest.mark.anyio
