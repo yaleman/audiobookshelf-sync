@@ -1,0 +1,20 @@
+[env]
+_.file = { path = ".envrc", redact = true, required = true }
+
+[tasks.fmt]
+run = "uv run ruff format"
+
+[tasks.ruff]
+depends = ["fmt"]
+run = "uv run ruff check --fix"
+
+[tasks.ty]
+depends = ["fmt"]
+run = "uv run ty check"
+
+[tasks.test]
+depends = ["fmt"]
+run = "uv run pytest"
+
+[tasks.check]
+depends = ["ruff", "ty", "test"]
