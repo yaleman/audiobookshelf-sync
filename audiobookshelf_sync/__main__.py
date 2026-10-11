@@ -6,6 +6,7 @@ from pathlib import Path
 
 import aiohttp
 import click
+import pydantic
 
 from audiobookshelf_sync.api import get_client
 from audiobookshelf_sync.config import Config
@@ -29,7 +30,10 @@ def main(ctx: click.Context) -> None:
 def search(limit: int) -> None:
     """Open the interactive search TUI."""
     logger = getLogger("audiobookshelf_sync")
-    config = Config.model_validate({})
+    try:
+        config = Config.model_validate({})
+    except pydantic.ValidationError as e:
+        click.echo(f"Configuration validation error: {e}", err=True)
     asyncio.run(run_search(config=config, limit=limit, logger=logger))
 
 
