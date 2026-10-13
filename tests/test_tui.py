@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from textual.command import CommandPalette
 from textual.widgets import Input, ListView, RadioButton, Static
 
 from audiobookshelf_sync.api import (
@@ -10,13 +11,10 @@ from audiobookshelf_sync.api import (
     BrowseMode,
     BrowsePage,
 )
+from audiobookshelf_sync.config import AppConfig, ConfigFile
 from audiobookshelf_sync.queue import (
     QueueItem,
     QueueStatus,
-    add_pending_item,
-    load_queue,
-    mark_done,
-    save_queue,
 )
 from audiobookshelf_sync.tui import EntryItem, ResultItem, SearchQueueApp, SortModal
 
@@ -241,7 +239,7 @@ async def test_pressing_enter_on_search_result_adds_it_to_queue(tmp_path: Path) 
         await pilot.press("enter")
         await pilot.pause()
 
-    queue = load_queue(queue_path)
+    queue = ConfigFile.load(queue_path)
     assert len(queue.items) == 1
     assert queue.items[0].id == "book-1"
 
@@ -251,15 +249,14 @@ async def test_search_result_already_in_queue_is_marked_selected(
     tmp_path: Path,
 ) -> None:
     queue_path = tmp_path / "audiobookshelf-sync.json"
-    queue = load_queue(queue_path)
-    add_pending_item(
-        queue,
+    config = ConfigFile.load(queue_path)
+    config.add_pending_item(
         item_id="book-1",
         library_id="library-1",
         title="Dune",
         author="Frank Herbert",
     )
-    save_queue(queue_path, queue)
+    config.save(queue_path)
     app = SearchQueueApp(
         client=object(),
         queue_path=queue_path,
@@ -282,19 +279,61 @@ async def test_search_result_already_in_queue_is_marked_selected(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("remaining_ids", "expected_index"),
+    [
+        (["book-0", "book-1", "book-2"], 1),
+        (["book-1", "book-2", "book-0"], 0),
+        (["book-0", "book-2"], 0),
+        (["book-2"], 0),
+        ([], None),
+    ],
+)
+async def test_refresh_queue_preserves_selection_or_selects_previous_row(
+    tmp_path: Path, remaining_ids: list[str], expected_index: int | None
+) -> None:
+    config_path = tmp_path / "audiobookshelf-sync.json"
+    config = ConfigFile.load(config_path)
+    for index in range(3):
+        config.add_pending_item(
+            item_id=f"book-{index}",
+            library_id="library-1",
+            title=f"Book {index}",
+            author="Author",
+        )
+    config.save(config_path)
+    app = SearchQueueApp(
+        client=object(),
+        queue_path=config_path,
+        limit=25,
+        list_books_func=fake_list_books,
+    )
+    app.config = AppConfig(config=config, config_path=config_path)
+
+    async with app.run_test() as pilot:
+        queue_list = app.query_one("#queue", ListView)
+        queue_list.index = 1
+        await pilot.pause()
+        items = {item.id: item for item in app.config.config.items}
+        app.config.config.items = [items[item_id] for item_id in remaining_ids]
+        await app.refresh_queue()
+        await pilot.pause()
+        assert queue_list.index == expected_index
+
+
+@pytest.mark.anyio
 async def test_pressing_d_on_queue_item_removes_it_and_refreshes_result_marker(
     tmp_path: Path,
 ) -> None:
     queue_path = tmp_path / "audiobookshelf-sync.json"
-    queue = load_queue(queue_path)
-    add_pending_item(
-        queue,
+    config = ConfigFile.load(queue_path)
+    config.add_pending_item(
         item_id="book-1",
         library_id="library-1",
         title="Dune",
         author="Frank Herbert",
     )
-    save_queue(queue_path, queue)
+    config.save(queue_path)
     app = SearchQueueApp(
         client=object(),
         queue_path=queue_path,
@@ -314,7 +353,7 @@ async def test_pressing_d_on_queue_item_removes_it_and_refreshes_result_marker(
         result_list = app.query_one("#results", ListView)
         first_result = result_list.children[0]
 
-    queue = load_queue(queue_path)
+    queue = ConfigFile.load(queue_path)
     assert queue.items == []
     assert isinstance(first_result, ResultItem)
     assert (
@@ -333,11 +372,11 @@ async def test_pressing_r_on_queue_item_resets_it_to_pending(tmp_path: Path) -> 
         author="Frank Herbert",
         error="old error",
     )
-    mark_done(item, output_dir=Path("downloads/Dune"))
+    item.mark_done(output_dir=Path("downloads/Dune"))
     item.error = "old error"
-    queue = load_queue(queue_path)
+    queue = ConfigFile.load(queue_path)
     queue.items.append(item)
-    save_queue(queue_path, queue)
+    queue.save(queue_path)
     app = SearchQueueApp(
         client=object(),
         queue_path=queue_path,
@@ -353,7 +392,7 @@ async def test_pressing_r_on_queue_item_resets_it_to_pending(tmp_path: Path) -> 
         await pilot.press("r")
         await pilot.pause()
 
-    queue = load_queue(queue_path)
+    queue = ConfigFile.load(queue_path)
     assert len(queue.items) == 1
     assert queue.items[0].status == QueueStatus.PENDING
     assert queue.items[0].downloaded_at is None
@@ -460,15 +499,14 @@ async def test_removing_queue_item_preserves_group_browse_results(
     tmp_path: Path,
 ) -> None:
     queue_path = tmp_path / "audiobookshelf-sync.json"
-    queue = load_queue(queue_path)
-    add_pending_item(
-        queue,
+    queue = ConfigFile.load(queue_path)
+    queue.add_pending_item(
         item_id="book-1",
         library_id="library-1",
         title="Dune",
         author="Frank Herbert",
     )
-    save_queue(queue_path, queue)
+    queue.save(queue_path)
     app = SearchQueueApp(
         client=object(),
         queue_path=queue_path,
@@ -552,11 +590,11 @@ async def test_bulk_add_requires_confirmation_and_queues_group_books(
         await pilot.pause()
         await pilot.press("b")
         await pilot.pause()
-        assert load_queue(queue_path).items == []
+        assert ConfigFile.load(queue_path).items == []
         await pilot.press("y")
         await pilot.pause()
 
-    queue = load_queue(queue_path)
+    queue = ConfigFile.load(queue_path)
     assert [item.id for item in queue.items] == ["book-1", "book-2"]
 
 
@@ -628,7 +666,7 @@ async def test_sorting_search_results_does_not_replace_search_or_queue(
         await pilot.pause()
         assert [book.id for book in app.results] == ["older", "newer"]
         assert app.query_one("#query", Input).value == "book"
-    assert load_queue(queue_path).items == []
+    assert ConfigFile.load(queue_path).items == []
 
 
 @pytest.mark.anyio
@@ -654,3 +692,136 @@ async def test_sort_choice_applies_when_opening_group_books(tmp_path: Path) -> N
         await pilot.press("enter")
         await pilot.pause()
         assert [book.id for book in app.results] == ["older", "newer"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ["add", "bulk_add", "remove", "reset"])
+async def test_tui_edits_preserve_external_queue_and_config_updates(
+    tmp_path: Path, action: str
+) -> None:
+    path = tmp_path / "audiobookshelf-sync.json"
+    config = ConfigFile()
+    for item_id in ["keep", "edit", "removed"]:
+        config.add_pending_item(item_id, "library-1", item_id, "Author")
+    config.items[1].mark_synchronised()
+    config.save(path)
+    app = SearchQueueApp(
+        client=object(), queue_path=path, limit=25, list_books_func=fake_list_books
+    )
+    async with app.run_test() as pilot:
+        queue_list = app.query_one("#queue", ListView)
+        queue_list.index = 1
+        queue_list.focus()
+        await pilot.pause()
+        updated = ConfigFile.load(path)
+        updated.items[0].mark_synchronised()
+        updated.remove_item("removed")
+        updated.add_pending_item("external", "library-1", "External", "Author")
+        servers = ConfigFile.model_validate(
+            {
+                "servers": {"https://new.example": {"token": "test-token"}},
+                "default_source": "https://new.example",
+            }
+        )
+        updated.servers = servers.servers
+        updated.default_source = servers.default_source
+        updated.save(path)
+        if action == "add":
+            result = app.query_one("#results", ListView).children[0]
+            assert isinstance(result, ResultItem)
+            await app.add_result_item(result)
+        elif action == "bulk_add":
+            app.drilled_entry = BrowseEntry(
+                id="author",
+                mode=BrowseMode.AUTHORS,
+                name="Author",
+                library_id="library-1",
+                library_name="Books",
+                count=2,
+            )
+            app.bulk_confirmation_pending = True
+            await app.action_confirm_bulk_add()
+        elif action == "remove":
+            await app.action_remove_queue_item()
+        else:
+            await app.action_reset_queue_item()
+        await pilot.pause()
+    saved = ConfigFile.load(path)
+    keep = saved.find_item("keep")
+    assert keep is not None
+    assert keep.status == QueueStatus.SYNCHRONISED
+    assert saved.find_item("external") is not None
+    assert saved.find_item("removed") is None
+    assert saved.servers == updated.servers
+    assert saved.default_source == updated.default_source
+    if action == "remove":
+        assert saved.find_item("edit") is None
+    elif action == "reset":
+        edit = saved.find_item("edit")
+        assert edit is not None
+        assert edit.status == QueueStatus.PENDING
+    else:
+        assert saved.find_item("book-1") is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [QueueStatus.DONE, QueueStatus.SYNCHRONISED])
+async def test_palette_clears_only_selected_status_from_latest_queue(
+    tmp_path: Path, status: QueueStatus
+) -> None:
+    path = tmp_path / "config.json"
+    config = ConfigFile()
+    for state in QueueStatus:
+        item = config.add_pending_item(state.value, "library-1", state.value, "Author")
+        item.status = state
+    config.save(path)
+    app = SearchQueueApp(
+        client=object(), queue_path=path, limit=25, list_books_func=fake_list_books
+    )
+    local_file = tmp_path / "book.m4b"
+    local_file.write_bytes(b"audio")
+    async with app.run_test() as pilot:
+        latest = ConfigFile.load(path)
+        latest.add_pending_item(
+            "book-1", "library-1", "Dune", "Frank Herbert"
+        ).status = status
+        latest.add_pending_item("external", "library-1", "External", "Author")
+        latest.save(path)
+        await pilot.press("ctrl+p")
+        assert isinstance(app.screen, CommandPalette)
+        await pilot.press(*f"Clear {status.value} items")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        saved = ConfigFile.load(path)
+        assert saved.find_item(status.value) is None
+        assert saved.find_item("book-1") is None
+        assert {item.id for item in saved.items} == {
+            state.value for state in QueueStatus if state != status
+        } | {"external"}
+        assert len(app.query_one("#queue", ListView).children) == len(saved.items)
+        assert app.status_message == f"Removed 2 {status.value} item(s) from the queue."
+        result = app.query_one("#results", ListView).children[0]
+        assert isinstance(result, ResultItem)
+        assert result.display_text.startswith("[ ]")
+    assert local_file.read_bytes() == b"audio"
+
+
+@pytest.mark.anyio
+async def test_clear_completed_items_is_blocked_during_sync(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    config = ConfigFile()
+    config.add_pending_item("done", "library-1", "Book", "Author").status = QueueStatus.DONE
+    config.save(path)
+    app = SearchQueueApp(
+        client=object(), queue_path=path, limit=25, list_books_func=fake_list_books
+    )
+    async with app.run_test():
+        app.sync_running = True
+        await app.action_clear_done()
+        await app.action_clear_synchronised()
+        assert ConfigFile.load(path).items == config.items
+        assert not any(
+            command.title.startswith("Clear ")
+            for command in app.get_system_commands(app.screen)
+        )

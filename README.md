@@ -45,6 +45,15 @@ narrators. Select a series, collection, author, or narrator to browse its books;
 press `Escape` to return to the group list. Press `b`, then confirm with `y`, to
 queue every book in the selected group.
 
+Press `Ctrl+P` and select `Sync` to sync queued books to the configured default
+target server and its target library. A modal shows progress, including file
+counts, and blocks queue actions until sync finishes. Metadata overwrite
+prompts appear in the TUI; close the progress modal after completion to return
+to the refreshed queue.
+
+The palette also offers `Clear done items` and `Clear synchronised items` to
+remove those entries from the queue. Downloaded files remain on disk.
+
 ## Download
 
 Process all pending queued books:

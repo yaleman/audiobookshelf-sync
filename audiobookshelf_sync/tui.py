@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from textual import work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     Footer,
@@ -22,7 +23,8 @@ from textual.widgets import (
     Static,
 )
 
-from audiobookshelf_sync.api import (
+from .api import (
+    AudiobookshelfClient,
     BookSearchResult,
     BookSort,
     BrowseEntry,
@@ -34,15 +36,9 @@ from audiobookshelf_sync.api import (
     search_books,
     sort_books,
 )
-from audiobookshelf_sync.queue import (
-    QUEUE_FILE,
-    QueueItem,
-    add_pending_item,
-    load_queue,
-    remove_item,
-    reset_item,
-    save_queue,
-)
+from .config import AppConfig, ConfigFile
+from .queue import QUEUE_FILE, QueueItem, QueueStatus
+from .sync_ui import SyncModal
 
 BROWSE_LIMIT = 50
 
@@ -222,6 +218,9 @@ class SearchQueueApp(App[None]):
         super().__init__()
         self.client = client
         self.queue_path = queue_path
+        self.config = AppConfig(
+            config_path=queue_path, config=ConfigFile.load(queue_path)
+        )
         self.limit = limit
         self.search_func = search_func
         self.list_books_func = list_books_func
@@ -238,6 +237,45 @@ class SearchQueueApp(App[None]):
         self.sort_selection = SortSelection(BookSort.ADDED_AT, descending=True)
         self.search_active = False
         self.status_message = ""
+        self.sync_running = False
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        yield from super().get_system_commands(screen)
+        if not self.sync_running:
+            yield SystemCommand(
+                "Sync", "Sync queued books to the configured target", self.action_sync
+            )
+            yield SystemCommand(
+                "Clear done items",
+                "Remove downloaded books from the queue",
+                self.action_clear_done,
+            )
+            yield SystemCommand(
+                "Clear synchronised items",
+                "Remove synchronised books from the queue",
+                self.action_clear_synchronised,
+            )
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if self.sync_running:
+            return False
+        return super().check_action(action, parameters)
+
+    @work
+    async def action_sync(self) -> None:
+        if self.sync_running:
+            return
+        self.sync_running = True
+        try:
+            self.config.config = ConfigFile.load(self.queue_path)
+            await self.push_screen_wait(
+                SyncModal(cast(AudiobookshelfClient, self.client), self.config)
+            )
+            self.config.config = ConfigFile.load(self.queue_path)
+        finally:
+            self.sync_running = False
+        await self.refresh_queue()
+        await self.refresh_results_pane()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -370,8 +408,8 @@ class SearchQueueApp(App[None]):
             sort=self.sort_selection.sort,
             descending=self.sort_selection.descending,
         )
-        queue = load_queue(self.queue_path)
-        selected_ids = {item.id for item in queue.items}
+        assert self.config is not None, "AppConfig must have a loaded ConfigFile"
+        selected_ids = {item.id for item in self.config.config.items or []}
         result_list = self.query_one("#results", ListView)
         selected_index = result_list.index
         await result_list.clear()
@@ -462,21 +500,20 @@ class SearchQueueApp(App[None]):
     async def action_confirm_bulk_add(self) -> None:
         if not self.bulk_confirmation_pending or self.drilled_entry is None:
             return
-        queue = load_queue(self.queue_path)
-        before_count = len(queue.items)
+        self.config.config = ConfigFile.load(self.queue_path)
+        before_count = len(self.config.config.items)
         for result in self.results:
-            add_pending_item(
-                queue,
+            self.config.config.add_pending_item(
                 item_id=result.id,
                 library_id=result.library_id,
                 title=result.title,
                 author=result.author,
             )
-        save_queue(self.queue_path, queue)
+        self.config.config.save(self.queue_path)
         self.bulk_confirmation_pending = False
         await self.refresh_queue()
         await self.refresh_results()
-        added_count = len(queue.items) - before_count
+        added_count = len(self.config.config.items) - before_count
         self.set_status(f"Queued {added_count} book(s) from {self.drilled_entry.name}.")
 
     def action_cancel_bulk_add(self) -> None:
@@ -485,6 +522,28 @@ class SearchQueueApp(App[None]):
         self.bulk_confirmation_pending = False
         self.set_status("Bulk add cancelled.")
 
+    async def action_clear_done(self) -> None:
+        await self.clear_queue_status(QueueStatus.DONE)
+
+    async def action_clear_synchronised(self) -> None:
+        await self.clear_queue_status(QueueStatus.SYNCHRONISED)
+
+    async def clear_queue_status(self, status: QueueStatus) -> None:
+        if self.sync_running:
+            return
+        self.config.config = ConfigFile.load(self.queue_path)
+        before_count = len(self.config.config.items)
+        self.config.config.items = [
+            item for item in self.config.config.items if item.status != status
+        ]
+        removed_count = before_count - len(self.config.config.items)
+        self.config.config.save(self.queue_path)
+        await self.refresh_queue()
+        await self.refresh_results_pane()
+        self.set_status(
+            f"Removed {removed_count} {status.value} item(s) from the queue."
+        )
+
     async def action_remove_queue_item(self) -> None:
         if not self.queue_has_focus():
             return
@@ -492,12 +551,13 @@ class SearchQueueApp(App[None]):
         if queue_item is None:
             self.set_status("Select a queue item first.")
             return
-        queue = load_queue(self.queue_path)
-        removed = remove_item(queue, queue_item.item_id)
+
+        self.config.config = ConfigFile.load(self.queue_path)
+        removed = self.config.config.remove_item(queue_item.item_id)
         if removed is None:
             self.set_status("Select a queue item first.")
             return
-        save_queue(self.queue_path, queue)
+        self.config.config.save(self.queue_path)
         await self.refresh_queue()
         await self.refresh_results_pane()
         self.set_status(f"Removed {removed.title}.")
@@ -509,12 +569,13 @@ class SearchQueueApp(App[None]):
         if queue_item is None:
             self.set_status("Select a queue item first.")
             return
-        queue = load_queue(self.queue_path)
-        reset = reset_item(queue, queue_item.item_id)
+
+        self.config.config = ConfigFile.load(self.queue_path)
+        reset = self.config.config.reset_item(queue_item.item_id)
         if reset is None:
             self.set_status("Select a queue item first.")
             return
-        save_queue(self.queue_path, queue)
+        self.config.config.save(self.queue_path)
         await self.refresh_queue()
         await self.refresh_results_pane()
         self.set_status(f"Reset {reset.title} to pending.")
@@ -524,19 +585,19 @@ class SearchQueueApp(App[None]):
             self.set_status("Select a result first.")
             return
         self.bulk_confirmation_pending = False
-        queue = load_queue(self.queue_path)
-        before_count = len(queue.items)
-        queued = add_pending_item(
-            queue,
+
+        self.config.config = ConfigFile.load(self.queue_path)
+        before_count = len(self.config.config.items)
+        queued = self.config.config.add_pending_item(
             item_id=item.result.id,
             library_id=item.result.library_id,
             title=item.result.title,
             author=item.result.author,
         )
-        save_queue(self.queue_path, queue)
+        self.config.config.save(self.queue_path)
         await self.refresh_queue()
         await self.refresh_results()
-        if len(queue.items) == before_count:
+        if len(self.config.config.items) == before_count:
             self.set_status(
                 f"{queued.title} is already queued with status {queued.status}."
             )
@@ -544,11 +605,24 @@ class SearchQueueApp(App[None]):
             self.set_status(f"Queued {queued.title}.")
 
     async def refresh_queue(self) -> None:
-        queue = load_queue(self.queue_path)
         queue_list = self.query_one("#queue", ListView)
+        current_selection = max(0, queue_list.index or 0)
+        highlighted_item = self.highlighted_queue_item()
+        selected_index = None
+
         await queue_list.clear()
-        for item in queue.items:
+        for index, item in enumerate(self.config.config.items):
             await queue_list.append(QueueListItem(item))
+            if highlighted_item is not None and item.id == highlighted_item.item_id:
+                selected_index = index
+        if self.config.config.items:
+            queue_list.index = (
+                selected_index
+                if selected_index is not None
+                else min(max(current_selection - 1, 0), len(queue_list.children) - 1)
+            )
+        else:
+            queue_list.index = None
 
     def queue_has_focus(self) -> bool:
         return self.query_one("#queue", ListView).has_focus
