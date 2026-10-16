@@ -1,5 +1,4 @@
 import json
-from dataclasses import dataclass
 
 import pytest
 
@@ -14,52 +13,10 @@ from audiobookshelf_sync.api import (
     search_books,
     sort_books,
 )
+from audiobookshelf_sync.test import FakeClient, FakeLibrary
 
 
-@dataclass
-class FakeLibrary:
-    id_: str
-    name: str
-    media_type: str
-
-
-class FakeClient:
-    async def get_all_libraries(self) -> list[FakeLibrary]:
-        return [
-            FakeLibrary(id_="books", name="Books", media_type="book"),
-            FakeLibrary(id_="podcasts", name="Podcasts", media_type="podcast"),
-        ]
-
-    async def _get(
-        self, endpoint: str, params: dict[str, str | int] | None = None
-    ) -> bytes:
-        assert endpoint == "/api/libraries/books/search"
-        assert params == {"q": "dune", "limit": 25}
-        return json.dumps(
-            {
-                "book": [
-                    {
-                        "libraryItem": {
-                            "id": "book-1",
-                            "libraryId": "books",
-                            "mediaType": "book",
-                            "size": 1234,
-                            "media": {
-                                "duration": 3600.0,
-                                "metadata": {
-                                    "title": "Dune",
-                                    "authorName": "Frank Herbert",
-                                },
-                            },
-                        }
-                    }
-                ],
-                "authors": [],
-            }
-        ).encode()
-
-
-class FakeAuthorClient:
+class FakeAuthorClient(FakeClient):
     def __init__(self) -> None:
         self.endpoints: list[str] = []
 
@@ -172,14 +129,7 @@ class FakeDuplicateAuthorClient(FakeAuthorClient):
         raise AssertionError(f"Unexpected endpoint: {endpoint}")
 
 
-class FakeBrowseClient:
-    async def get_all_libraries(self) -> list[FakeLibrary]:
-        return [
-            FakeLibrary(id_="books", name="Books", media_type="book"),
-            FakeLibrary(id_="other-books", name="Other Books", media_type="book"),
-            FakeLibrary(id_="podcasts", name="Podcasts", media_type="podcast"),
-        ]
-
+class FakeBrowseClient(FakeClient):
     async def _get(
         self, endpoint: str, params: dict[str, str | int] | None = None
     ) -> bytes:
@@ -252,7 +202,7 @@ class FakeBrowseClient:
         raise AssertionError(f"Unexpected endpoint: {endpoint}")
 
 
-class FakeBrowseEntryClient:
+class FakeBrowseEntryClient(FakeClient):
     async def get_all_libraries(self) -> list[FakeLibrary]:
         return [
             FakeLibrary(id_="books", name="Books", media_type="book"),
@@ -341,7 +291,7 @@ class FakeBrowseEntryClient:
         raise AssertionError(f"Unexpected endpoint: {endpoint}")
 
 
-class FakeEntryBooksClient:
+class FakeEntryBooksClient(FakeClient):
     async def get_all_libraries(self) -> list[FakeLibrary]:
         return [FakeLibrary(id_="books", name="Books", media_type="book")]
 
@@ -482,7 +432,7 @@ def test_sort_books_supports_every_field_and_direction_with_missing_values_last(
 
 @pytest.mark.anyio
 async def test_list_books_merges_multiple_libraries_across_page_boundaries() -> None:
-    class SortedClient:
+    class SortedClient(FakeClient):
         async def get_all_libraries(self) -> list[FakeLibrary]:
             return [
                 FakeLibrary("first", "First", "book"),

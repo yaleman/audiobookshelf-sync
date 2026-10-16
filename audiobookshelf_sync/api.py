@@ -1,22 +1,40 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from base64 import b64encode
-from collections.abc import AsyncIterator
+from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from logging import Logger
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import aiohttp
+import click
 from aioaudiobookshelf import (
     SessionConfiguration,
-    get_user_client_by_token,
     get_user_client,
+    get_user_client_by_token,
 )
+from aioaudiobookshelf.schema.library import LibraryItemBook, LibraryItemExpandedBook
 
-from audiobookshelf_sync.config import Config
+from audiobookshelf_sync.config import AppConfig, Server
+from audiobookshelf_sync.queue import QueueItem, QueueStatus
+
+UNSAFE_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_path_part(value: str) -> str:
+    sanitized = UNSAFE_PATH_CHARS.sub("_", value).strip().rstrip(".")
+    sanitized = re.sub(r"_\s+_", "_ ", sanitized)
+    sanitized = re.sub(r"_+", "_", sanitized)
+    sanitized = sanitized.strip("_")
+    return sanitized or "untitled"
 
 
 @dataclass(frozen=True)
@@ -107,16 +125,25 @@ class BrowsePage[T]:
 
 
 class AudiobookshelfClient(Protocol):
+    session_config: SessionConfiguration
+
     async def get_all_libraries(self) -> list[Any]: ...
 
     async def _get(
         self, endpoint: str, params: dict[str, str | int] | None = None
     ) -> bytes: ...
 
+    async def _patch(self, endpoint: str, data: dict[str, Any]) -> bytes: ...
+
+    async def get_library_item_book(
+        self, *, book_id: str, expanded: bool = False
+    ) -> LibraryItemBook | LibraryItemExpandedBook: ...
+
 
 async def get_client(
-    session: aiohttp.ClientSession, config: Config, logger: Logger
-) -> Any:
+    session: aiohttp.ClientSession, config: Server, logger: Logger
+) -> AudiobookshelfClient:
+    assert config.url is not None
     if config.token is not None:
         return await get_user_client_by_token(
             session_config=SessionConfiguration(
@@ -142,11 +169,6 @@ async def get_client(
         raise ValueError(
             "Invalid configuration: either token or username/password must be provided"
         )
-
-
-async def iter_client(config: Config, logger: Logger) -> AsyncIterator[Any]:
-    async with aiohttp.ClientSession() as session:
-        yield await get_client(session, config, logger)
 
 
 async def search_books(
@@ -474,3 +496,392 @@ def _author_name(metadata: dict[str, Any]) -> str:
         if isinstance(author, dict) and author.get("name")
     ]
     return ", ".join(names) if names else "Unknown Author"
+
+
+@dataclass
+class PendingUpload:
+    source: dict[str, Any]
+    title: str
+    library_id: str
+    items: list[QueueItem]
+
+
+SYNC_INDEX_ATTEMPTS = 60
+SYNC_INDEX_POLL_INTERVAL = 5
+
+
+async def sync_items(
+    *,
+    source_client: AudiobookshelfClient,
+    target_client: AudiobookshelfClient,
+    target_library: str,
+    app_config: AppConfig,
+    reporter: Callable[[str], None],
+    confirm_overwrite: Callable[[str], Awaitable[bool]] | None = None,
+) -> None:
+    if not app_config.config.items:
+        reporter("No queued items to sync.")
+        return
+    items = []
+    for item in app_config.config.items:
+        if item.status == QueueStatus.SYNCHRONISED:
+            reporter(f"Skipping synchronised: {item.title}")
+        else:
+            items.append(item)
+    if not items:
+        reporter("No pending items to sync.")
+        return
+    if source_client.session_config.url.rstrip(
+        "/"
+    ) == target_client.session_config.url.rstrip("/"):
+        raise ValueError("Source and target must be different servers.")
+    libraries = await _book_libraries(target_client)
+    inventory = {
+        library.id_: await _sync_library_items(target_client, library.id_)
+        for library in libraries
+    }
+    failures = 0
+    uploads: list[PendingUpload] = []
+    for queued in items:
+        try:
+            source = json.loads(
+                await source_client._get(
+                    f"/api/items/{queued.id}", params={"expanded": 1}
+                )
+            )
+            if source.get("mediaType") != "book":
+                raise ValueError("Only books can be synced.")
+            media = _sync_media(source)
+            if not media["metadata"].get("title"):
+                raise ValueError("Source book has no title.")
+            matches = [
+                item
+                for items in inventory.values()
+                for item in items
+                if _same_book(source, item)
+            ]
+            if len(matches) > 1:
+                raise ValueError(
+                    "Multiple target books match; refusing an ambiguous overwrite."
+                )
+            if matches:
+                target = json.loads(
+                    await target_client._get(f"/api/items/{matches[0]['id']}")
+                )
+                target_media = _sync_media(target)
+                if media == target_media:
+                    app_config.mark_synchronised([queued])
+                    reporter(f"Already synced: {queued.title}")
+                    continue
+                reporter(
+                    f"Metadata changes for {queued.title}: {', '.join(key for key in media if media[key] != target_media[key])}"
+                )
+                prompt = f"Overwrite target metadata for '{queued.title}'?"
+                confirmed = (
+                    await confirm_overwrite(prompt)
+                    if confirm_overwrite is not None
+                    else click.confirm(prompt, default=False)
+                )
+                if not confirmed:
+                    reporter(f"Skipped: {queued.title}")
+                    continue
+            else:
+                pending_upload = next(
+                    (upload for upload in uploads if _same_book(source, upload.source)),
+                    None,
+                )
+                if pending_upload is not None:
+                    pending_upload.items.append(queued)
+                    reporter(f"Already uploaded; awaiting indexing: {queued.title}")
+                    continue
+                destinations = [
+                    library for library in libraries if target_library == library.name
+                ]
+                if not destinations and len(libraries) == 1:
+                    destinations = libraries
+                if len(destinations) != 1 or len(destinations[0].folders) != 1:
+                    raise ValueError(
+                        "A unique target book library and folder are required."
+                    )
+                library = destinations[0]
+                reporter(f"Uploading: {queued.title} to {library.name}")
+                await _upload_sync_book(
+                    source_client, target_client, source, library, reporter=reporter
+                )
+                uploads.append(
+                    PendingUpload(source, queued.title, library.id_, [queued])
+                )
+                reporter(f"Uploaded; awaiting indexing: {queued.title}")
+                continue
+            updated = await _apply_sync_metadata(target_client, target, media)
+            for items in inventory.values():
+                for index, item in enumerate(items):
+                    if item["id"] == updated["id"]:
+                        items[index] = updated
+            app_config.mark_synchronised([queued])
+            reporter(f"Synced: {queued.title}")
+        except Exception as error:  # noqa: BLE001 - report item failures and continue the queue.
+            if isinstance(error, click.Abort):
+                raise
+            failures += 1
+            reporter(f"Failed: {queued.title}: {error}")
+    if uploads:
+        failures += await _finish_uploaded_books(
+            target_client, uploads, app_config, reporter
+        )
+    if failures:
+        raise ValueError(f"Sync failed for {failures} item(s).")
+
+
+async def _apply_sync_metadata(
+    client: AudiobookshelfClient, target: dict[str, Any], media: dict[str, Any]
+) -> dict[str, Any]:
+    await client._patch(f"/api/items/{target['id']}/media", data=media)
+    updated = json.loads(await client._get(f"/api/items/{target['id']}"))
+    if _sync_media(updated) != media:
+        raise ValueError("Target metadata does not match the source after updating.")
+    return updated
+
+
+async def _finish_uploaded_books(
+    client: AudiobookshelfClient,
+    uploads: list[PendingUpload],
+    app_config: AppConfig,
+    reporter: Callable[[str], None],
+) -> int:
+    reporter("Uploads complete. Requesting target library scans.")
+    config = client.session_config
+    for library_id in dict.fromkeys(upload.library_id for upload in uploads):
+        try:
+            async with config.session.post(
+                f"{config.url.rstrip('/')}/api/libraries/{quote(library_id, safe='')}/scan",
+                headers=config.headers,
+                ssl=config.verify_ssl,
+                timeout=config.timeout,
+            ) as response:
+                response.raise_for_status()
+                await response.read()
+            reporter(f"Scan requested: {library_id}")
+        except (aiohttp.ClientError, TimeoutError) as error:
+            reporter(
+                f"Could not request scan for {library_id}: {error}. Waiting for indexing."
+            )
+    reporter(f"Waiting for {len(uploads)} book(s) to be indexed (up to 5 minutes).")
+    failures = 0
+    pending = list(uploads)
+    for _ in range(SYNC_INDEX_ATTEMPTS):
+        await asyncio.sleep(SYNC_INDEX_POLL_INTERVAL)
+        inventory: dict[str, list[dict[str, Any]]] = {}
+        for upload in list(pending):
+            try:
+                if upload.library_id not in inventory:
+                    inventory[upload.library_id] = await _sync_library_items(
+                        client, upload.library_id
+                    )
+                matches = [
+                    item
+                    for item in inventory[upload.library_id]
+                    if _same_book(upload.source, item)
+                ]
+                if not matches:
+                    continue
+                if len(matches) > 1:
+                    raise ValueError("Uploaded book has multiple target matches.")
+                await _apply_sync_metadata(
+                    client, matches[0], _sync_media(upload.source)
+                )
+                app_config.mark_synchronised(upload.items)
+                reporter(f"Synced: {upload.title}")
+            except Exception as error:  # noqa: BLE001 - finish other accepted uploads.
+                if isinstance(error, click.Abort):
+                    raise
+                failures += 1
+                reporter(f"Failed: {upload.title}: {error}")
+            pending.remove(upload)
+        if not pending:
+            break
+    for upload in pending:
+        reporter(
+            f"Uploaded; indexing still pending: {upload.title}. "
+            "Run sync again after indexing finishes to apply metadata."
+        )
+    return failures
+
+
+async def _sync_library_items(client: Any, library_id: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 0
+    while True:
+        payload = json.loads(
+            await client._get(
+                f"/api/libraries/{library_id}/items",
+                params={"limit": 100, "page": page},
+            )
+        )
+        batch = payload.get("results", [])
+        items.extend(batch)
+        if len(items) >= payload.get("total", len(items)):
+            return items
+        if not batch:
+            raise ValueError(
+                "Target library pagination ended before all items were returned."
+            )
+        page += 1
+
+
+def _sync_media(item: dict[str, Any]) -> dict[str, Any]:
+    media = item["media"]
+    raw = media["metadata"]
+    fields = (
+        "title",
+        "subtitle",
+        "narrators",
+        "genres",
+        "publishedYear",
+        "publishedDate",
+        "publisher",
+        "description",
+        "isbn",
+        "asin",
+        "language",
+        "explicit",
+    )
+    metadata = {key: raw[key] for key in fields if key in raw}
+    metadata["authors"] = [
+        {"name": author["name"]} for author in raw.get("authors", [])
+    ]
+    metadata["series"] = [
+        {"name": series["name"], "sequence": series.get("sequence")}
+        for series in raw.get("series", [])
+    ]
+    return {"metadata": metadata, "tags": media.get("tags") or []}
+
+
+def _same_book(source: dict[str, Any], target: dict[str, Any]) -> bool:
+    if target.get("mediaType") != "book":
+        return False
+    left, right = source["media"]["metadata"], target["media"]["metadata"]
+    for key in ("asin", "isbn"):
+        if left.get(key) and right.get(key):
+            return (
+                str(left[key]).strip().casefold() == str(right[key]).strip().casefold()
+            )
+    return bool(left.get("title")) and (
+        str(left["title"]).strip().casefold(),
+        _author_name(left).strip().casefold(),
+    ) == (
+        str(right.get("title", "")).strip().casefold(),
+        _author_name(right).strip().casefold(),
+    )
+
+
+async def _upload_sync_book(
+    source_client: AudiobookshelfClient,
+    target_client: AudiobookshelfClient,
+    source: dict[str, Any],
+    library: Any,
+    *,
+    reporter: Callable[[str], None],
+) -> None:
+    book = await source_client.get_library_item_book(
+        book_id=source["id"], expanded=True
+    )
+    if not isinstance(book, LibraryItemExpandedBook):
+        raise ValueError("Source book is not an expanded library item.")
+    if not book.media.tracks:
+        raise ValueError("Source book has no audio tracks.")
+    has_cover = bool(source["media"].get("coverPath"))
+    file_count = len(book.media.tracks) + int(has_cover)
+    with (
+        TemporaryDirectory(prefix="audiobookshelf-sync-") as directory,
+        ExitStack() as files,
+    ):
+        form = aiohttp.FormData()
+        form.add_field("title", source["media"]["metadata"]["title"])
+        form.add_field("author", _author_name(source["media"]["metadata"]))
+        form.add_field("library", library.id_)
+        form.add_field("folder", library.folders[0].id_)
+        for number, track in enumerate(book.media.tracks, start=1):
+            filename = track_filename(track, track_number=number)
+            destination = Path(directory) / f"{number}-{filename}"
+            reporter(f"Downloading file {number}/{file_count}: {filename}")
+            await download_track(
+                client=source_client,
+                content_url=track.content_url,
+                destination=destination,
+            )
+            reporter(f"Prepared file {number}/{file_count}: {filename}")
+            form.add_field(
+                str(number),
+                files.enter_context(destination.open("rb")),
+                filename=f"{number:04d}-{filename}",
+            )
+        if has_cover:
+            reporter(f"Downloading file {file_count}/{file_count}: cover.jpg")
+            cover_path = Path(directory) / "cover.jpg"
+            await download_track(
+                client=source_client,
+                content_url=f"/api/items/{source['id']}/cover?raw=1&format=jpeg",
+                destination=cover_path,
+            )
+            reporter(f"Prepared file {file_count}/{file_count}: cover.jpg")
+            form.add_field(
+                "cover",
+                files.enter_context(cover_path.open("rb")),
+                filename="cover.jpg",
+                content_type="image/jpeg",
+            )
+        config = target_client.session_config
+        reporter(f"Uploading {file_count} file(s) to {library.name}")
+        async with config.session.post(
+            f"{config.url.rstrip('/')}/api/upload",
+            data=form,
+            headers=config.headers,
+            ssl=config.verify_ssl,
+            timeout=config.timeout,
+        ) as response:
+            response.raise_for_status()
+            await response.read()
+        reporter(f"Uploaded {file_count}/{file_count} file(s)")
+
+
+async def download_track(
+    *, client: AudiobookshelfClient, content_url: str, destination: Path
+) -> None:
+    url = urljoin(f"{client.session_config.url.rstrip('/')}/", content_url.lstrip("/"))
+    temporary_destination = destination.with_suffix(destination.suffix + ".part")
+    async with client.session_config.session.get(
+        url,
+        ssl=client.session_config.verify_ssl,
+        headers=client.session_config.headers,
+        timeout=client.session_config.timeout,
+    ) as response:
+        response.raise_for_status()
+        with temporary_destination.open("wb") as handle:
+            async for chunk in response.content.iter_chunked(1024 * 256):
+                if chunk:
+                    handle.write(chunk)
+    temporary_destination.replace(destination)
+
+
+def _suffix_for_mime_type(mime_type: str | None) -> str:
+    if mime_type == "audio/mp4":
+        return ".m4a"
+    if mime_type == "audio/ogg":
+        return ".ogg"
+    if mime_type == "audio/flac":
+        return ".flac"
+    return ".mp3"
+
+
+def track_filename(track: Any, *, track_number: int) -> str:
+    metadata = getattr(track, "metadata", None)
+    metadata_filename = (
+        getattr(metadata, "filename", None) if metadata is not None else None
+    )
+    if metadata_filename:
+        return sanitize_path_part(str(metadata_filename))
+
+    title = getattr(track, "title", None) or f"Track {track_number}"
+    suffix = _suffix_for_mime_type(getattr(track, "mime_type", None))
+    return f"{track_number:02d} {sanitize_path_part(str(title))}{suffix}"
